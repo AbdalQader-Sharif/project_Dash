@@ -1,0 +1,10 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+node_modules/
+package-lock.json
+.env
+*.log
+mosquitto/data/*
+!mosquitto/data/.gitkeep
