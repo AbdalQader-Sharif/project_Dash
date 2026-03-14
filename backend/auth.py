@@ -5,6 +5,18 @@ from typing import Optional
 from fastapi import Depends, HTTPException, status
 from fastapi.security import OAuth2PasswordBearer
 from jose import JWTError, jwt
+
+# bcrypt 4.x removed __about__; patch it so passlib 1.7.4 can detect the version
+import bcrypt as _bcrypt_pkg
+if not hasattr(_bcrypt_pkg, '__about__'):
+    try:
+        from importlib.metadata import version as _pkg_version
+        _bcrypt_ver = _pkg_version('bcrypt')
+    except Exception:
+        _bcrypt_ver = getattr(_bcrypt_pkg, '__version__', '0.0.0')
+    _bcrypt_pkg.__about__ = type('__about__', (), {'__version__': _bcrypt_ver})()
+    del _bcrypt_ver
+
 from passlib.context import CryptContext
 
 from models import User
