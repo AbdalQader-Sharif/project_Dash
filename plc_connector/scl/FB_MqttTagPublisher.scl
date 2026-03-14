@@ -1,0 +1,223 @@
+// ============================================================================
+// FB_MqttTagPublisher  –  Publish all sensor tags to Mosquitto via native MQTT
+// ============================================================================
+// Purpose:
+//   Orchestrates the full publish cycle for every sensor tag defined in
+//   DB_MqttConfig.  On each OB1 (or cyclic-interrupt OB) call it:
+//     1. Maintains an MQTT_Connect session (reconnects on drop-outs).
+//     2. Iterates over every tag in DB_MqttConfig.tags[].
+//     3. Calls FC_BuildJsonPayload to assemble the JSON string.
+//     4. Calls MQTT_Publish with the resulting string as the PAYLOAD.
+//
+// Firmware requirement:  S7-1200 CPU firmware V4.4 or newer.
+// Library requirement:   LMQTT library (part of TIA Portal V17+).
+//                        Add via "Options → Manage general libraries →
+//                        LMQTT_Client".
+//
+// Prerequisites:
+//   • DB_MqttConfig compiled and downloaded.
+//   • FC_BuildJsonPayload compiled and downloaded.
+//   • FC_RealToDecStr compiled and downloaded.
+//   • An instance DB for this FB (created automatically by TIA Portal when
+//     you call the FB from OB1).
+//   • A global DB "DB_SensorValues" with one REAL variable per tag, arranged
+//     in the same order as DB_MqttConfig.tags[] (see DB_SensorValues template
+//     in the README).
+//
+// Call from OB1 (example):
+//   "FB_MqttTagPublisher_Instance"(enable := TRUE);
+//
+// Timing note:
+//   The publishInterval static variable controls how often tags are sent
+//   (default 2 000 ms).  Adjust to match your OB1 cycle time and desired
+//   MQTT update rate.
+// ============================================================================
+
+FUNCTION_BLOCK "FB_MqttTagPublisher"
+{ S7_Optimized_Access := 'TRUE' }
+VERSION : 0.1
+
+// ── Interface ─────────────────────────────────────────────────────────────────
+VAR_INPUT
+    enable          : BOOL := TRUE;    // FALSE freezes publishing (no disconnect)
+    publishInterval : TIME := T#2S;   // how often to send the tag batch
+END_VAR
+
+VAR_OUTPUT
+    connected : BOOL;    // mirrored from DB_MqttConfig.connected
+    lastError : WORD;    // last MQTT status word (0 = OK)
+END_VAR
+
+VAR
+    // ── Timekeeping ───────────────────────────────────────────────────────────
+    publishTimer    : TON;            // interval timer between publish cycles
+    connectRetryTmr : TON;           // back-off timer for reconnect attempts
+
+    // ── MQTT instruction instances ────────────────────────────────────────────
+    mqttConnect     : MQTT_Connect;
+    mqttPublish     : MQTT_Publish;
+    mqttDisconnect  : MQTT_Disconnect;
+
+    // ── Internal state ────────────────────────────────────────────────────────
+    connectReq      : BOOL := FALSE;  // rising-edge trigger for MQTT_Connect
+    publishReq      : BOOL := FALSE;  // rising-edge trigger for MQTT_Publish
+    currentTag      : INT  := 1;      // index into DB_MqttConfig.tags[]
+    publishCycle    : BOOL := FALSE;  // TRUE while iterating through tags
+END_VAR
+
+VAR_TEMP
+    tsLreal   : LREAL;        // current Unix timestamp (seconds)
+    payload   : STRING[500];  // JSON string for the current tag
+    topic     : STRING[100];  // MQTT topic = "plant/" + tagName
+    tagVal    : REAL;         // sensor value read from DB_SensorValues
+    anomalyOk : BOOL;         // anomaly flag (FALSE for all tags here)
+END_VAR
+
+BEGIN
+    // ── 0. Mirror connection state to output ──────────────────────────────────
+    connected := "DB_MqttConfig".connected;
+
+    IF NOT enable THEN
+        RETURN;
+    END_IF;
+
+    // ── 1. Establish / maintain MQTT connection ───────────────────────────────
+    IF NOT "DB_MqttConfig".connected THEN
+        // Start connection attempt (edge-triggered)
+        connectReq := TRUE;
+        mqttConnect(REQ          := connectReq,
+                    BROKER_IP    := "DB_MqttConfig".brokerIp,
+                    BROKER_PORT  := "DB_MqttConfig".brokerPort,
+                    CLIENT_ID    := "DB_MqttConfig".clientId,
+                    KEEP_ALIVE   := "DB_MqttConfig".keepAlive,
+                    HNDL_CONNECT => "DB_MqttConfig".mqttHandle);
+        connectReq := FALSE;  // reset after one scan
+
+        IF mqttConnect.DONE THEN
+            "DB_MqttConfig".connected := TRUE;
+            lastError := 0;
+        ELSIF mqttConnect.ERROR THEN
+            lastError := mqttConnect.STATUS;
+            // Retry after 5 s
+            connectRetryTmr(IN := TRUE, PT := T#5S);
+            IF connectRetryTmr.Q THEN
+                connectRetryTmr(IN := FALSE);  // reset timer
+            END_IF;
+        END_IF;
+        RETURN;  // do not publish until connected
+    END_IF;
+
+    // ── 2. Interval timer – wait between publish cycles ───────────────────────
+    publishTimer(IN := NOT publishCycle, PT := publishInterval);
+
+    IF publishTimer.Q AND NOT publishCycle THEN
+        // Timer elapsed → start a new publish cycle from tag index 1
+        publishCycle := TRUE;
+        currentTag   := 1;
+        publishTimer(IN := FALSE);  // reset
+    END_IF;
+
+    IF NOT publishCycle THEN
+        RETURN;  // nothing to do yet
+    END_IF;
+
+    // ── 3. Publish one tag per OB1 scan to avoid blocking the CPU ─────────────
+    // Obtain the current Unix timestamp in seconds as LREAL.
+    // GET_LTIME() returns nanoseconds since 1970-01-01 as LWORD (uint64).
+    // Strategy: divide nanoseconds by 1_000_000_000 as LINT (integer seconds)
+    // before casting to LREAL.  LINT division truncates sub-second fractions
+    // intentionally — sensor telemetry does not need sub-second timestamps —
+    // and avoids the precision loss that a direct LWORD_TO_LREAL cast would
+    // introduce for values larger than 2^53 (≈ year 2255).
+    tsLreal := LINT_TO_LREAL(LWORD_TO_LINT(GET_LTIME()) / LINT#1000000000);
+
+    // Read the sensor value for the current tag from the sensor data block.
+    // DB_SensorValues must have one REAL per tag in the same order as
+    // DB_MqttConfig.tags[].
+    //
+    //   CASE currentTag OF
+    //     1:  tagVal := "DB_SensorValues".pump1_flow;
+    //     2:  tagVal := "DB_SensorValues".pump1_pressure;
+    //     … etc.
+    //   END_CASE;
+    //
+    // Replace the CASE block with the appropriate symbolic address references
+    // for your actual sensor data block layout.
+    CASE currentTag OF
+        1:  tagVal := "DB_SensorValues".pump1_flow;
+        2:  tagVal := "DB_SensorValues".pump1_pressure;
+        3:  tagVal := "DB_SensorValues".pump1_temperature;
+        4:  tagVal := "DB_SensorValues".pump1_current;
+        5:  tagVal := "DB_SensorValues".pump1_vibration;
+        6:  tagVal := "DB_SensorValues".pump2_flow;
+        7:  tagVal := "DB_SensorValues".pump2_pressure;
+        8:  tagVal := "DB_SensorValues".pump2_temperature;
+        9:  tagVal := "DB_SensorValues".pump2_current;
+        10: tagVal := "DB_SensorValues".pump2_vibration;
+        11: tagVal := "DB_SensorValues".tank1_level;
+        12: tagVal := "DB_SensorValues".tank2_level;
+        13: tagVal := "DB_SensorValues".compressor_pressure;
+        14: tagVal := "DB_SensorValues".compressor_temperature;
+        15: tagVal := "DB_SensorValues".heat_exchanger_inlet_temp;
+        16: tagVal := "DB_SensorValues".heat_exchanger_outlet_temp;
+        17: tagVal := "DB_SensorValues".conveyor_speed;
+        18: tagVal := "DB_SensorValues".conveyor_current;
+        19: tagVal := "DB_SensorValues".boiler_pressure;
+        20: tagVal := "DB_SensorValues".boiler_temperature;
+        21: tagVal := "DB_SensorValues".boiler_flow;
+    ELSE
+        tagVal := 0.0;
+    END_CASE;
+
+    // Anomaly detection is left to the backend; always publish FALSE here.
+    // Override this if you want to raise anomaly flags from the PLC side.
+    anomalyOk := FALSE;
+
+    // ── 4. Build JSON payload using FC_BuildJsonPayload ───────────────────────
+    //
+    // This is the SCL equivalent of the LAD/FBD pattern:
+    //   [S_CONV: REAL→STRING] → [Concat: tag header + value]
+    //                         → [Concat: + unit field]
+    //                         → [Concat: + timestamp]
+    //                         → [Concat: + anomaly + closing brace]
+    //                         → MQTT_Publish.PAYLOAD
+    //
+    payload := "FC_BuildJsonPayload"(
+                    tagName   := "DB_MqttConfig".tags[currentTag].name,
+                    tagValue  := tagVal,
+                    unit      := "DB_MqttConfig".tags[currentTag].unit,
+                    timestamp := tsLreal,
+                    anomaly   := anomalyOk);
+
+    // ── 5. Compose the MQTT topic: "plant/<tagName>" ──────────────────────────
+    topic := CONCAT(IN1 := 'plant/',
+                    IN2 := "DB_MqttConfig".tags[currentTag].name);
+
+    // ── 6. Publish ────────────────────────────────────────────────────────────
+    publishReq := TRUE;
+    mqttPublish(REQ          := publishReq,
+                HNDL_PUBLISH := "DB_MqttConfig".mqttHandle,
+                TOPIC        := topic,
+                PAYLOAD      := payload,
+                QOS          := 0,
+                RETAIN        := FALSE);
+    publishReq := FALSE;  // reset trigger
+
+    IF mqttPublish.ERROR THEN
+        lastError := mqttPublish.STATUS;
+        // On publish error assume connection is broken – force reconnect
+        IF mqttPublish.STATUS = 16#80A3 OR  // connection lost
+           mqttPublish.STATUS = 16#8090 THEN // not connected
+            "DB_MqttConfig".connected := FALSE;
+        END_IF;
+    ELSIF mqttPublish.DONE THEN
+        lastError := 0;
+    END_IF;
+
+    // ── 7. Advance to next tag, end cycle when all tags are published ─────────
+    currentTag := currentTag + 1;
+    IF currentTag > "DB_MqttConfig".tagCount THEN
+        publishCycle := FALSE;  // finished; wait for next timer expiry
+        currentTag   := 1;
+    END_IF;
+END_FUNCTION_BLOCK

@@ -169,8 +169,58 @@ The backend expects each MQTT message to contain a JSON object with these fields
 }
 ```
 
-Build the payload string inside the PLC using `S_CONV` / `Concat` blocks or a structured
-string builder SCL function, then pass it to `MQTT_Publish`.
+#### Building the payload string on the PLC
+
+The `plc_connector/scl/` directory contains ready-to-use TIA Portal SCL source files that
+build the JSON payload string on the PLC and pass it to `MQTT_Publish`:
+
+| File | Description |
+|------|-------------|
+| [`FC_RealToDecStr.scl`](plc_connector/scl/FC_RealToDecStr.scl) | Converts a `REAL` to a clean decimal string (`"6.12"`) — avoids the leading space and E-notation that `REAL_TO_STRING` can produce |
+| [`FC_BuildJsonPayload.scl`](plc_connector/scl/FC_BuildJsonPayload.scl) | Assembles the full JSON string using `CONCAT` (the SCL equivalent of the S_CONV + Concat block chain in LAD/FBD) |
+| [`DB_MqttConfig.scl`](plc_connector/scl/DB_MqttConfig.scl) | Global Data Block holding broker IP, port, and the tag name/unit table for all 21 sensors |
+| [`FB_MqttTagPublisher.scl`](plc_connector/scl/FB_MqttTagPublisher.scl) | Function Block that manages `MQTT_Connect`, iterates over all tags each cycle, calls `FC_BuildJsonPayload`, and passes the result to `MQTT_Publish` |
+
+##### How to import into TIA Portal
+
+1. In the project tree, right-click **Program blocks → External source files → Add new external
+   file** and add each `.scl` file from the `plc_connector/scl/` folder.
+2. Right-click each added source → **Generate blocks from source** — TIA Portal compiles
+   the SCL and creates the FC/FB/DB automatically.
+3. In OB1 (or a cyclic-interrupt OB), call `FB_MqttTagPublisher` and wire:
+   - `enable := TRUE`
+   - `publishInterval := T#2S`
+   - Create a companion sensor data block `DB_SensorValues` with one `REAL` member per tag
+     (see the `CASE` block inside `FB_MqttTagPublisher.scl` for the expected variable names).
+4. Download the project and go online — the dashboard will immediately start showing live data.
+
+##### How `FC_BuildJsonPayload` works (S_CONV / Concat pattern)
+
+```
+                  ┌─────────────────────────────────────────────────────────────────┐
+                  │                  FC_BuildJsonPayload                            │
+                  │                                                                  │
+  REAL tagValue ──┤──► FC_RealToDecStr ──► sValue                                  │
+                  │        (≡ S_CONV block)                                         │
+                  │                                        buf := '{"tag":"'        │
+  STRING tagName ─┤──────────────────────────────────────► buf := CONCAT(buf, tag)  │
+                  │                                        buf := CONCAT(buf, ...)   │
+  REAL tagValue ──┤──► sValue ────────────────────────────► buf := CONCAT(buf, val) │
+                  │                                        buf := CONCAT(buf, ...)   │
+  STRING unit ────┤──────────────────────────────────────► buf := CONCAT(buf, unit) │
+                  │        (each CONCAT ≡ one Concat       buf := CONCAT(buf, ...)   │
+  LREAL timestamp ┤──► LREAL_TO_STRING ───────────────────► buf := CONCAT(buf, ts)  │
+                  │         block in LAD/FBD)              buf := CONCAT(buf, ...)   │
+  BOOL anomaly ───┤──► IF/ELSE → "true"/"false" ─────────► buf := CONCAT(buf, bool)│
+                  │                                        buf := CONCAT(buf, '}')  │
+                  │                                                  │               │
+                  └──────────────────────────────────────────────────┼───────────────┘
+                                                                     ▼
+                                                           MQTT_Publish.PAYLOAD
+```
+
+Each `CONCAT` call in the SCL function mirrors one **Concat** block in a LAD/FBD network, and
+`FC_RealToDecStr` mirrors an **S_CONV** block that converts `REAL → STRING`.
 
 No changes to the rest of the stack are required — the backend subscribes to `plant/#` and
 will immediately start displaying your real PLC data.

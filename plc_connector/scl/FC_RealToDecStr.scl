@@ -1,0 +1,109 @@
+// ============================================================================
+// FC_RealToDecStr  –  Convert a REAL value to a compact decimal string
+// ============================================================================
+// Purpose:
+//   REAL_TO_STRING() on S7-1200 produces output such as " 6.120000" (with a
+//   leading space) or "1.000000E+01" (scientific notation).  Neither format
+//   is valid inside a JSON number field.  This function produces a clean
+//   decimal representation, e.g. "6.12" or "-3.5", suitable for embedding
+//   directly in a JSON string.
+//
+// Algorithm:
+//   1. Separate the integer and fractional parts via TRUNC / ABS arithmetic.
+//   2. Build the integer part with INT_TO_STRING and prepend '-' if negative.
+//   3. Compute up to 3 decimal digits (rounding at the 4th digit).
+//   4. Concatenate integer part + '.' + fractional digits, dropping trailing
+//      zeros so that "6.000" becomes "6.0" (one digit is always kept so the
+//      string remains a JSON number, not an integer literal).
+//
+// Inputs  : value  REAL   – the number to convert
+// Outputs : return STRING[30] – compact decimal string, e.g. "6.12", "-3.5"
+//
+// Limitations:
+//   • Magnitude must be within ±99 999 (INT range for the integer part).
+//   • Values outside that range fall back to REAL_TO_STRING() output.
+//   • NaN / ±INF are not handled (not expected in normal sensor data).
+// ============================================================================
+
+FUNCTION "FC_RealToDecStr" : STRING[30]
+{ S7_Optimized_Access := 'TRUE' }
+VERSION : 0.1
+
+VAR_INPUT
+    value : REAL;   // REAL sensor value to format
+END_VAR
+
+VAR_TEMP
+    absVal   : REAL;    // absolute value of input
+    intPart  : INT;     // integer part (truncated)
+    fracReal : REAL;    // fractional remainder  0.0 .. <1.0
+    d1       : INT;     // 1st decimal digit
+    d2       : INT;     // 2nd decimal digit
+    d3       : INT;     // 3rd decimal digit
+    sInt     : STRING[20];  // integer part as string
+    sFrac    : STRING[10];  // decimal digits string
+END_VAR
+
+BEGIN
+    // ── Guard: fall back for very large values that overflow INT ──────────────
+    absVal := ABS(value);
+    IF absVal >= 32768.0 THEN  // TRUNC of values >= 32768.0 overflows INT (range -32768..32767)
+        // REAL_TO_STRING may have a leading space – LEFT/MID trim is not
+        // needed here because the back-end JSON parser tolerates the space,
+        // and this path is only reached for out-of-range magnitudes anyway.
+        "FC_RealToDecStr" := REAL_TO_STRING(value);
+        RETURN;
+    END_IF;
+
+    // ── Integer part ──────────────────────────────────────────────────────────
+    intPart := REAL_TO_INT(TRUNC(absVal));   // magnitude, always non-negative
+    sInt    := INT_TO_STRING(intPart);
+
+    IF value < 0.0 THEN
+        sInt := CONCAT(IN1 := '-', IN2 := sInt);
+    END_IF;
+
+    // ── Fractional part (3 decimal digits) ────────────────────────────────────
+    fracReal := absVal - TRUNC(absVal);      // 0.0 .. <1.0
+
+    d1 := REAL_TO_INT(TRUNC(fracReal * 10.0));
+    fracReal := fracReal * 10.0 - TRUNC(fracReal * 10.0);
+
+    d2 := REAL_TO_INT(TRUNC(fracReal * 10.0));
+    fracReal := fracReal * 10.0 - TRUNC(fracReal * 10.0);
+
+    // Round at the 4th digit
+    d3 := REAL_TO_INT(TRUNC(fracReal * 10.0 + 0.5));
+    IF d3 >= 10 THEN          // carry
+        d3 := 0;
+        d2 := d2 + 1;
+        IF d2 >= 10 THEN
+            d2 := 0;
+            d1 := d1 + 1;
+            IF d1 >= 10 THEN  // e.g. 9.9995 rounds to 10.000
+                d1    := 0;
+                intPart := intPart + 1;
+                sInt    := INT_TO_STRING(intPart);
+                IF value < 0.0 THEN
+                    sInt := CONCAT(IN1 := '-', IN2 := sInt);
+                END_IF;
+            END_IF;
+        END_IF;
+    END_IF;
+
+    // ── Drop trailing zeros (always keep at least one decimal digit) ──────────
+    IF d3 <> 0 THEN
+        sFrac := CONCAT(IN1 := INT_TO_STRING(d1),
+                        IN2 := CONCAT(IN1 := INT_TO_STRING(d2),
+                                      IN2 := INT_TO_STRING(d3)));
+    ELSIF d2 <> 0 THEN
+        sFrac := CONCAT(IN1 := INT_TO_STRING(d1),
+                        IN2 := INT_TO_STRING(d2));
+    ELSE
+        sFrac := INT_TO_STRING(d1);   // at least one digit after the dot
+    END_IF;
+
+    // ── Assemble and return ───────────────────────────────────────────────────
+    "FC_RealToDecStr" := CONCAT(IN1 := sInt,
+                                IN2 := CONCAT(IN1 := '.', IN2 := sFrac));
+END_FUNCTION
