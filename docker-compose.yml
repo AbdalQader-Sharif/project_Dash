@@ -34,6 +34,30 @@ services:
     networks:
       - plc_network
 
+  # ── Real PLC connector (Siemens S7-1200 via snap7 + MQTT) ──────────────────
+  # Enable with: docker compose --profile real-plc up
+  # Before starting, edit plc_connector/tag_config.json to set your PLC IP
+  # and map Data Block addresses to the sensor tags expected by the backend.
+  # You can also override settings via environment variables (see plc_connector.py).
+  plc-connector:
+    build: ./plc_connector
+    profiles:
+      - real-plc
+    depends_on:
+      - mosquitto
+    environment:
+      - MQTT_BROKER=mosquitto
+      # Override the PLC address here or edit tag_config.json:
+      - PLC_IP=${PLC_IP:-192.168.0.1}
+      - PLC_RACK=${PLC_RACK:-0}
+      - PLC_SLOT=${PLC_SLOT:-1}
+      - POLL_INTERVAL=${POLL_INTERVAL:-2}
+    volumes:
+      # Mount the config at runtime so you can edit tags without rebuilding:
+      - ./plc_connector/tag_config.json:/app/tag_config.json:ro
+    networks:
+      - plc_network
+
   backend:
     build: ./backend
     ports:
