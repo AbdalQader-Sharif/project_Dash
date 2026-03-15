@@ -1,12 +1,14 @@
 // ============================================================================
 // FC_RealToDecStr  –  Convert a REAL value to a compact decimal string
 // ============================================================================
+// Target: Siemens S7-1200, Siemens LMQTT library (TIA Portal V17+).
+//
 // Purpose:
 //   REAL_TO_STRING() on S7-1200 produces output such as " 6.120000" (with a
 //   leading space) or "1.000000E+01" (scientific notation).  Neither format
 //   is valid inside a JSON number field.  This function produces a clean
 //   decimal representation, e.g. "6.12" or "-3.5", suitable for embedding
-//   directly in a JSON string.
+//   directly in a JSON string passed to MQTT_Publish.PAYLOAD.
 //
 // Algorithm:
 //   1. Separate the integer and fractional parts via TRUNC / ABS arithmetic.
@@ -14,20 +16,20 @@
 //   3. Compute up to 3 decimal digits (rounding at the 4th digit).
 //   4. Concatenate integer part + '.' + fractional digits, dropping trailing
 //      zeros so that "6.000" becomes "6.0" (one digit is always kept so the
-//      string remains a JSON number, not an integer literal).
+//      string remains a valid JSON number, not an integer literal).
 //
 // Inputs  : value  REAL   – the number to convert
 // Outputs : return STRING[30] – compact decimal string, e.g. "6.12", "-3.5"
 //
 // Limitations:
-//   • Magnitude must be within ±99 999 (INT range for the integer part).
-//   • Values outside that range fall back to REAL_TO_STRING() output.
-//   • NaN / ±INF are not handled (not expected in normal sensor data).
+//   • Magnitude must be within -32768 to +32767 (full INT range for the integer part).
+//   • Values with |magnitude| >= 32768 fall back to REAL_TO_STRING() output.
+//   • NaN / ±INF are not handled (not expected from normal sensor readings).
 // ============================================================================
 
 FUNCTION "FC_RealToDecStr" : STRING[30]
 { S7_Optimized_Access := 'TRUE' }
-VERSION : 0.1
+VERSION : 0.2
 
 VAR_INPUT
     value : REAL;   // REAL sensor value to format

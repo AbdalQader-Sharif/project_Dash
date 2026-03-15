@@ -1,63 +1,58 @@
 // ============================================================================
 // DB_MqttConfig  –  Global Data Block: MQTT broker settings & tag list
 // ============================================================================
-// Purpose:
-//   Centralises all MQTT connection parameters and the per-tag metadata that
-//   FB_MqttTagPublisher needs.  Edit this DB in TIA Portal to match your
-//   actual broker address and PLC sensor layout.
+// Target: Siemens S7-1200 with the Siemens LMQTT library (TIA Portal V17+).
 //
-// ⚠️  IMPORTANT – Before downloading to the PLC, update the following fields:
-//   • brokerIp   → IP address of the machine running Docker / Mosquitto
-//   • clientId   → any unique string to identify this PLC on the broker
+// Purpose:
+//   Centralises all MQTT connection parameters and the per-tag metadata used
+//   by FB_MqttTagPublisher.  Edit this DB to match your broker address and
+//   PLC sensor layout before downloading.
+//
+// ⚠️  IMPORTANT – update before downloading to the CPU:
+//   • brokerIp  → IP address of the machine running Docker / Mosquitto
+//   • clientId  → any unique string that identifies this PLC on the broker
 //
 // How to add this block to TIA Portal:
-//   1. In the project tree, right-click "Program blocks" → Add new block.
+//   1. Right-click "Program blocks" → Add new block.
 //   2. Select "Data block", name it "DB_MqttConfig", type = Global DB.
-//   3. Copy-paste the variable declarations below into the SCL editor
-//      (or switch to the data view and add the variables manually).
-//   4. Uncheck "Optimized block access" in the DB Properties so that the
-//      python-snap7 connector (Approach A) can read it if needed.
+//   3. Import this file via "External source files → Generate blocks from
+//      source", or copy the declarations into the SCL editor manually.
 // ============================================================================
 
 DATA_BLOCK "DB_MqttConfig"
-{ S7_Optimized_Access := 'FALSE' }  // non-optimized for PUT/GET compatibility
-VERSION : 0.1
+{ S7_Optimized_Access := 'TRUE' }
+VERSION : 0.2
 
 STRUCT
     // ── Broker connection ─────────────────────────────────────────────────────
-    // ⚠️  Update brokerIp to the IP of the host running Docker before download.
-    // The default '0.0.0.0' is intentionally invalid — the FB will not connect
-    // until you replace it with your actual Docker host IP address.
-    brokerIp   : STRING[15] := '0.0.0.0';      // ← CHANGE to your Docker host IP
+    // ⚠️  The default '0.0.0.0' is intentionally invalid.
+    //     Replace it with the IP of the host running Mosquitto before download.
+    brokerIp   : STRING[15] := '0.0.0.0';      // ← CHANGE to your broker IP
     brokerPort : UINT       := 1883;            // default Mosquitto port
     clientId   : STRING[30] := 'S7-1200-PLC';  // unique client identifier
     keepAlive  : UINT       := 60;             // MQTT keep-alive in seconds
 
     // ── Runtime state (written by FB_MqttTagPublisher) ────────────────────────
-    mqttHandle : UDINT      := 0;              // connection handle from MQTT_Connect
-    connected  : BOOL       := FALSE;          // TRUE when broker connection is up
+    mqttHandle : UDINT := 0;    // connection handle returned by MQTT_Connect
+    connected  : BOOL  := FALSE; // TRUE when broker session is active
 
     // ── Tag table ─────────────────────────────────────────────────────────────
-    // Each entry maps one physical sensor to its MQTT topic metadata.
-    // tagCount must match the number of populated entries.
-    tagCount   : INT := 21;
+    // tagCount must equal the number of populated entries in tags[].
+    tagCount : INT := 21;
 
     tags : ARRAY[1..21] OF STRUCT
-        name    : STRING[80];  // tag identifier   e.g. 'pump1/pressure'
-        unit    : STRING[20];  // engineering unit  e.g. 'bar'
+        name : STRING[80];  // MQTT tag identifier, e.g. 'pump1/pressure'
+        unit : STRING[20];  // engineering unit,    e.g. 'bar'
     END_STRUCT;
 
 END_STRUCT
 
 BEGIN
-    // ── Broker connection ─────────────────────────────────────────────────────
-    // ⚠️  Update brokerIp to the IP of the host running Docker before download.
-    brokerIp   := '0.0.0.0';      // ← CHANGE to your Docker host IP
+    brokerIp   := '0.0.0.0';      // ← CHANGE to your broker IP
     brokerPort := 1883;
     clientId   := 'S7-1200-PLC';
     keepAlive  := 60;
-
-    tagCount := 21;
+    tagCount   := 21;
 
     // ── Pump 1 ────────────────────────────────────────────────────────────────
     tags[1].name  := 'pump1/flow';         tags[1].unit  := 'm3/h';
@@ -77,7 +72,7 @@ BEGIN
     tags[11].name := 'tank1/level';        tags[11].unit := '%';
     tags[12].name := 'tank2/level';        tags[12].unit := '%';
 
-    // ── Compressor ───────────────────────────────────────────────────────────
+    // ── Compressor ────────────────────────────────────────────────────────────
     tags[13].name := 'compressor/pressure';     tags[13].unit := 'bar';
     tags[14].name := 'compressor/temperature';  tags[14].unit := 'C';
 
