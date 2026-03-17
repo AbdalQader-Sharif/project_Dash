@@ -1,58 +1,75 @@
 // ============================================================================
-// DB_MqttConfig  –  Global Data Block: MQTT broker settings & tag list
+// DB_MqttConfig  –  Global Data Block: MQTT broker settings and tag list
 // ============================================================================
-// Target: Siemens S7-1200 with the Siemens LMQTT library (TIA Portal V17+).
+// Target  : Siemens S7-1200, TIA Portal V17 or newer.
+// Library : Siemens LMQTT_Client (add via Options → Manage general libraries).
 //
-// Purpose:
-//   Centralises all MQTT connection parameters and the per-tag metadata used
-//   by FB_MqttTagPublisher.  Edit this DB to match your broker address and
-//   PLC sensor layout before downloading.
+// STEP-BY-STEP: How to add this block in TIA Portal
+// --------------------------------------------------
+// 1. In the Project tree, expand your CPU and open "Program blocks".
+// 2. Click "Add new block" → choose "Data block" → type: Global DB.
+// 3. Name it "DB_MqttConfig".  Keep "Optimized block access" enabled.
+// 4. Right-click the DB → "Generate blocks from source" and import this file,
+//    OR copy the declarations below into the SCL editor manually.
+// 5. Set brokerIp to the IP address of the machine running Mosquitto/Docker.
+// 6. Set unixEpochOffset (see explanation below).
+// 7. Compile and download to the PLC.
 //
-// ⚠️  IMPORTANT – update before downloading to the CPU:
-//   • brokerIp  → IP address of the machine running Docker / Mosquitto
-//   • clientId  → any unique string that identifies this PLC on the broker
+// unixEpochOffset – How to set the correct Unix timestamp
+// -------------------------------------------------------
+// GET_LTIME() returns nanoseconds elapsed since the PLC last powered on,
+// not a calendar timestamp.  To produce proper Unix epoch values:
+//   a) Note the current Unix timestamp (e.g. from https://www.unixtimestamp.com).
+//   b) Note the PLC uptime shown in the Online & diagnostics view.
+//   c) unixEpochOffset = current_unix_timestamp − PLC_uptime_seconds
 //
-// How to add this block to TIA Portal:
-//   1. Right-click "Program blocks" → Add new block.
-//   2. Select "Data block", name it "DB_MqttConfig", type = Global DB.
-//   3. Import this file via "External source files → Generate blocks from
-//      source", or copy the declarations into the SCL editor manually.
+// Example: Unix time = 1 710 000 000, PLC has been running 120 s
+//          → unixEpochOffset := 1709999880.0
+//
+// Leave unixEpochOffset := 0.0 during initial testing; the backend will
+// still receive valid data — only the wall-clock timestamp will be offset
+// from actual calendar time.
 // ============================================================================
 
 DATA_BLOCK "DB_MqttConfig"
 { S7_Optimized_Access := 'TRUE' }
-VERSION : 0.2
+VERSION : 1.0
 
 STRUCT
-    // ── Broker connection ─────────────────────────────────────────────────────
-    // ⚠️  The default '0.0.0.0' is intentionally invalid.
-    //     Replace it with the IP of the host running Mosquitto before download.
-    brokerIp   : STRING[15] := '0.0.0.0';      // ← CHANGE to your broker IP
-    brokerPort : UINT       := 1883;            // default Mosquitto port
-    clientId   : STRING[30] := 'S7-1200-PLC';  // unique client identifier
-    keepAlive  : UINT       := 60;             // MQTT keep-alive in seconds
 
-    // ── Runtime state (written by FB_MqttTagPublisher) ────────────────────────
-    mqttHandle : UDINT := 0;    // connection handle returned by MQTT_Connect
-    connected  : BOOL  := FALSE; // TRUE when broker session is active
+    // ── Broker connection ─────────────────────────────────────────────────────
+    brokerIp        : STRING[15] := '192.168.1.100'; // ← CHANGE: IP of Mosquitto host
+    brokerPort      : UINT       := 1883;           // default Mosquitto/MQTT port
+    clientId        : STRING[30] := 'S7-1200-PLC'; // unique ID on the broker
+    keepAlive       : UINT       := 60;            // MQTT keep-alive in seconds
+
+    // ── Unix timestamp calibration ────────────────────────────────────────────
+    // Set this to (current_unix_time − PLC_uptime_seconds) before first run.
+    // See the header comment above for the calculation.
+    unixEpochOffset : LREAL := 0.0;
+
+    // ── Runtime state (managed by FB_MqttTagPublisher) ───────────────────────
+    mqttHandle : UDINT := 0;     // connection handle returned by MQTT_Connect
+    connected  : BOOL  := FALSE; // TRUE while broker session is alive
 
     // ── Tag table ─────────────────────────────────────────────────────────────
-    // tagCount must equal the number of populated entries in tags[].
+    // tagCount must match the number of populated tags[] entries.
     tagCount : INT := 21;
 
     tags : ARRAY[1..21] OF STRUCT
-        name : STRING[80];  // MQTT tag identifier, e.g. 'pump1/pressure'
-        unit : STRING[20];  // engineering unit,    e.g. 'bar'
+        name : STRING[80];  // tag identifier published to MQTT, e.g. 'pump1/pressure'
+        unit : STRING[20];  // engineering unit,                  e.g. 'bar'
     END_STRUCT;
 
 END_STRUCT
 
 BEGIN
-    brokerIp   := '0.0.0.0';      // ← CHANGE to your broker IP
-    brokerPort := 1883;
-    clientId   := 'S7-1200-PLC';
-    keepAlive  := 60;
-    tagCount   := 21;
+    brokerIp        := '192.168.1.100'; // ← CHANGE to your broker IP
+    brokerPort      := 1883;
+    clientId        := 'S7-1200-PLC';
+    keepAlive       := 60;
+    unixEpochOffset := 0.0;            // ← CHANGE: see header for calculation
+    tagCount        := 21;
 
     // ── Pump 1 ────────────────────────────────────────────────────────────────
     tags[1].name  := 'pump1/flow';         tags[1].unit  := 'm3/h';
@@ -73,19 +90,20 @@ BEGIN
     tags[12].name := 'tank2/level';        tags[12].unit := '%';
 
     // ── Compressor ────────────────────────────────────────────────────────────
-    tags[13].name := 'compressor/pressure';     tags[13].unit := 'bar';
-    tags[14].name := 'compressor/temperature';  tags[14].unit := 'C';
+    tags[13].name := 'compressor/pressure';    tags[13].unit := 'bar';
+    tags[14].name := 'compressor/temperature'; tags[14].unit := 'C';
 
     // ── Heat exchanger ────────────────────────────────────────────────────────
-    tags[15].name := 'heat_exchanger/inlet_temp';   tags[15].unit := 'C';
-    tags[16].name := 'heat_exchanger/outlet_temp';  tags[16].unit := 'C';
+    tags[15].name := 'heat_exchanger/inlet_temp';  tags[15].unit := 'C';
+    tags[16].name := 'heat_exchanger/outlet_temp'; tags[16].unit := 'C';
 
     // ── Conveyor ──────────────────────────────────────────────────────────────
-    tags[17].name := 'conveyor/speed';    tags[17].unit := 'm/min';
-    tags[18].name := 'conveyor/current';  tags[18].unit := 'A';
+    tags[17].name := 'conveyor/speed';   tags[17].unit := 'm/min';
+    tags[18].name := 'conveyor/current'; tags[18].unit := 'A';
 
     // ── Boiler ────────────────────────────────────────────────────────────────
-    tags[19].name := 'boiler/pressure';     tags[19].unit := 'bar';
-    tags[20].name := 'boiler/temperature';  tags[20].unit := 'C';
-    tags[21].name := 'boiler/flow';         tags[21].unit := 'm3/h';
+    tags[19].name := 'boiler/pressure';    tags[19].unit := 'bar';
+    tags[20].name := 'boiler/temperature'; tags[20].unit := 'C';
+    tags[21].name := 'boiler/flow';        tags[21].unit := 'm3/h';
+
 END_DATA_BLOCK

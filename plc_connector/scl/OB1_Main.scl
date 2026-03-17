@@ -1,0 +1,211 @@
+// ============================================================================
+// OB1_Main  –  Main Organisation Block: process program entry point
+// ============================================================================
+// Target  : Siemens S7-1200 CPU, firmware V4.4 or newer.
+// Library : Siemens LMQTT_Client (TIA Portal V17+).
+//
+// PURPOSE
+// -------
+// OB1 is the cyclic main program.  It runs every PLC scan.  This block shows
+// the complete integration:
+//   1. Read raw analog inputs (AI channels) and scale them to engineering units.
+//   2. Write the scaled values into DB_SensorValues.
+//   3. Call FB_MqttTagPublisher which publishes each tag over MQTT using the
+//      JSON schema expected by the project_Dash backend.
+//
+// STEP-BY-STEP: Setting up in TIA Portal from scratch
+// ----------------------------------------------------
+// Step 1 – Hardware configuration
+//   a) Open "Devices & networks" and add your S7-1200 CPU.
+//   b) Add any signal modules (SM 1231 AI etc.) in the device view.
+//   c) Note the I/O addresses assigned by TIA Portal (e.g. %IW64, %IW66, …).
+//   d) Save and compile the hardware configuration.
+//
+// Step 2 – Install the LMQTT library
+//   a) Options → Manage general libraries → Global libraries.
+//   b) Click "Open library" and navigate to the LMQTT_Client library file
+//      (LMqtt_Client_Vx_x.zal17 or similar, downloaded from Siemens Industry).
+//   c) Drag "LMQTT_Client" into your project's "Project library" panel.
+//   d) TIA Portal will automatically add MQTT_Connect, MQTT_Publish,
+//      MQTT_Disconnect FBs to the library.
+//
+// Step 3 – Import the SCL source files (in this exact order)
+//   a) In the Project tree, right-click the CPU → "External source files".
+//   b) Import each SCL file in the order listed below.  For each one, right-
+//      click the imported file and choose "Generate blocks from source":
+//        1. DB_MqttConfig.scl       → creates DB "DB_MqttConfig"
+//        2. DB_SensorValues.scl     → creates DB "DB_SensorValues"
+//        3. FC_RealToDecStr.scl     → creates FC "FC_RealToDecStr"
+//        4. FC_BuildJsonPayload.scl → creates FC "FC_BuildJsonPayload"
+//        5. FB_MqttTagPublisher.scl → creates FB "FB_MqttTagPublisher"
+//        6. OB1_Main.scl            → replaces or updates OB1
+//
+// Step 4 – Configure DB_MqttConfig
+//   a) Open DB_MqttConfig in the project tree.
+//   b) Set brokerIp to the IP address of the machine running Mosquitto
+//      (the host running docker-compose, e.g. '192.168.1.100').
+//   c) Set unixEpochOffset (see DB_MqttConfig.scl header for instructions).
+//   d) Verify tagCount and the tags[] array match your sensor layout.
+//   e) Compile and download the DB to the PLC.
+//
+// Step 5 – Wire physical I/O to DB_SensorValues
+//   In OB1 Network 1–N (LAD networks), for each analog input channel:
+//   a) Add a NORM_X block: normalise the raw INT AI value (0–27648) to [0.0, 1.0].
+//   b) Add a SCALE_X block: scale [0.0, 1.0] to [min_EU, max_EU] in engineering
+//      units (e.g. 0.0–16.0 bar, 0–120 °C, etc.).
+//   c) Connect the SCALE_X output to the matching DB_SensorValues member.
+//
+//   Example LAD network for pump1_pressure (4–20 mA → 0–16 bar transmitter):
+//
+//   ┌──────────────────────────────────────────────────────────────────────┐
+//   │  Network 1 – Scale pump1 pressure AI → DB_SensorValues              │
+//   │                                                                       │
+//   │          NORM_X                        SCALE_X                       │
+//   │         ┌────────┐                    ┌─────────┐                    │
+//   │  MIN ───┤ 0      │                    │ 0.0  MIN├─── (not used)      │
+//   │  %IW64 ─┤ VALUE  ├── normalized ─────►│ VALUE   │                    │
+//   │  MAX ───┤ 27648  │                    │ 16.0 MAX├──► "DB_SensorValues"│
+//   │         └────────┘                    └─────────┘    .pump1_pressure  │
+//   └──────────────────────────────────────────────────────────────────────┘
+//
+//   Repeat this pattern for every analog input channel, adjusting the
+//   I/O address (%IWxx), the engineering-unit range (MIN/MAX of SCALE_X),
+//   and the destination DB_SensorValues member.
+//
+// Step 6 – Call FB_MqttTagPublisher (already in this OB1 below, Network 2)
+//   The FB is called once per scan.  It manages the MQTT connection and
+//   publishes one sensor tag per scan cycle.
+//
+// Step 7 – Compile, download, and go online
+//   a) Compile all blocks (Ctrl+B).
+//   b) Download to the PLC (Ctrl+L).
+//   c) Open the Monitor/Modify table and watch DB_MqttConfig.connected flip
+//      to TRUE once the MQTT session is established.
+//   d) Check the project_Dash dashboard – your live PLC data should appear.
+// ============================================================================
+
+ORGANIZATION_BLOCK "OB1_Main"
+{ S7_Optimized_Access := 'TRUE' }
+VERSION : 1.0
+
+// ── Instance DB for FB_MqttTagPublisher (created automatically by TIA Portal)
+VAR_TEMP
+    tmpNormalized : REAL;   // scratch variable for NORM_X output
+END_VAR
+
+BEGIN
+
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    // SECTION A: Scale analog inputs → DB_SensorValues
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    // Replace %IWxx addresses and EU ranges with your actual hardware values.
+    //
+    // In LAD you would use NORM_X + SCALE_X blocks in separate networks.
+    // In SCL the same result is achieved with a linear formula:
+    //   EU_value = (raw_INT - raw_min) / (raw_max - raw_min) * (EU_max - EU_min) + EU_min
+    //
+    // The standard S7-1200 AI range for 0-20 mA / 4-20 mA is 0–27648.
+    // Adjust raw_min to 5530 for 4 mA start-of-range if using 4-20 mA.
+    //
+    // ── Pump 1 ────────────────────────────────────────────────────────────────
+
+    // Network A1 – pump1/flow  (0–100 m3/h  →  AI %IW64)
+    "DB_SensorValues".pump1_flow :=
+        0.0;  // ← replace with scaled AI value, e.g. NORM_X/SCALE_X output for %IW64
+
+    // Network A2 – pump1/pressure  (0–16 bar  →  AI %IW66)
+    "DB_SensorValues".pump1_pressure :=
+        0.0;             // ← replace with scaled AI value
+
+    // Network A3 – pump1/temperature  (0–120 °C  →  AI %IW68)
+    "DB_SensorValues".pump1_temperature :=
+        0.0;
+
+    // Network A4 – pump1/current  (0–32 A  →  AI %IW70)
+    "DB_SensorValues".pump1_current :=
+        0.0;
+
+    // Network A5 – pump1/vibration  (0–20 mm/s  →  AI %IW72)
+    "DB_SensorValues".pump1_vibration :=
+        0.0;
+
+    // ── Pump 2 ────────────────────────────────────────────────────────────────
+
+    "DB_SensorValues".pump2_flow        := 0.0;  // ← %IW80
+    "DB_SensorValues".pump2_pressure    := 0.0;  // ← %IW82
+    "DB_SensorValues".pump2_temperature := 0.0;  // ← %IW84
+    "DB_SensorValues".pump2_current     := 0.0;  // ← %IW86
+    "DB_SensorValues".pump2_vibration   := 0.0;  // ← %IW88
+
+    // ── Tanks ─────────────────────────────────────────────────────────────────
+
+    "DB_SensorValues".tank1_level := 0.0;  // ← %IW96  (0–100%)
+    "DB_SensorValues".tank2_level := 0.0;  // ← %IW98
+
+    // ── Compressor ────────────────────────────────────────────────────────────
+
+    "DB_SensorValues".compressor_pressure    := 0.0;  // ← %IW100
+    "DB_SensorValues".compressor_temperature := 0.0;  // ← %IW102
+
+    // ── Heat exchanger ────────────────────────────────────────────────────────
+
+    "DB_SensorValues".heat_exchanger_inlet_temp  := 0.0;  // ← %IW104
+    "DB_SensorValues".heat_exchanger_outlet_temp := 0.0;  // ← %IW106
+
+    // ── Conveyor ──────────────────────────────────────────────────────────────
+
+    "DB_SensorValues".conveyor_speed   := 0.0;  // ← %IW108
+    "DB_SensorValues".conveyor_current := 0.0;  // ← %IW110
+
+    // ── Boiler ────────────────────────────────────────────────────────────────
+
+    "DB_SensorValues".boiler_pressure    := 0.0;  // ← %IW112
+    "DB_SensorValues".boiler_temperature := 0.0;  // ← %IW114
+    "DB_SensorValues".boiler_flow        := 0.0;  // ← %IW116
+
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    // SECTION B: Call MQTT publisher
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    // FB_MqttTagPublisher manages the broker connection, builds the JSON
+    // payload with FC_BuildJsonPayload, and calls MQTT_Publish for one tag
+    // per scan so the CPU is never blocked.
+    //
+    // In LAD, this appears as a function-block call box in a network:
+    //
+    //  ┌──────────────────────────────────────────────────────────┐
+    //  │  Network B1 – MQTT publisher                              │
+    //  │                                                           │
+    //  │  |──────────────────────────────────────────────────|    │
+    //  │                      FB_MqttTagPublisher_DB           │    │
+    //  │                       (FB_MqttTagPublisher)           │    │
+    //  │                      ┌───────────────────┐            │    │
+    //  │  TRUE ──────────────►│ enable            │            │    │
+    //  │  T#2S ──────────────►│ publishInterval   │            │    │
+    //  │                      │                   │            │    │
+    //  │                      │ connected ────────►── M1.0    │    │
+    //  │                      │ lastError ────────►── MW10    │    │
+    //  │                      └───────────────────┘           │    │
+    //  └──────────────────────────────────────────────────────────┘
+
+    "FB_MqttTagPublisher_DB"(
+        enable          := TRUE,   // keep MQTT publishing active continuously
+        publishInterval := T#2S);  // publish full tag batch every 2 seconds
+
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    // SECTION C: (Optional) Monitor connection status
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    // DB_MqttConfig.connected is TRUE when the MQTT session is alive.
+    // DB_MqttConfig.mqttHandle holds the connection handle.
+    // FB_MqttTagPublisher_DB.lastError holds the most recent LMQTT status word.
+    //
+    // You can wire DB_MqttConfig.connected to a pilot light output coil in a
+    // LAD network to give a visual MQTT-connected indicator on the panel:
+    //
+    //  ┌──────────────────────────────────────────────────────────┐
+    //  │  Network C1 – Panel indicator: MQTT connected            │
+    //  │                                                           │
+    //  │  |──["DB_MqttConfig".connected]──────────( %Q0.0 )──|   │
+    //  │                                                           │
+    //  └──────────────────────────────────────────────────────────┘
+
+END_ORGANIZATION_BLOCK

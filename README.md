@@ -97,32 +97,34 @@ The backend expects each MQTT message to carry a JSON object with these fields:
 
 #### SCL blocks — ready to import into TIA Portal
 
-The `plc_connector/scl/` directory contains four SCL source files that implement the complete
+The `plc_connector/scl/` directory contains six SCL source files that implement the complete
 payload-building and MQTT-publishing pipeline on the S7-1200:
 
 | File | Description |
 |------|-------------|
+| [`DB_MqttConfig.scl`](plc_connector/scl/DB_MqttConfig.scl) | Global Data Block — broker IP/port, keep-alive, Unix epoch offset, and tag name/unit table for all 21 sensors |
+| [`DB_SensorValues.scl`](plc_connector/scl/DB_SensorValues.scl) | Global Data Block — one `REAL` member per sensor tag; your process program writes live readings here each scan |
 | [`FC_RealToDecStr.scl`](plc_connector/scl/FC_RealToDecStr.scl) | Converts a `REAL` to a compact decimal string (`"6.12"`) — avoids the leading space and E-notation produced by `REAL_TO_STRING` |
 | [`FC_BuildJsonPayload.scl`](plc_connector/scl/FC_BuildJsonPayload.scl) | Assembles the full JSON string via a chain of `CONCAT` calls (S_CONV + Concat block pattern) |
-| [`DB_MqttConfig.scl`](plc_connector/scl/DB_MqttConfig.scl) | Global Data Block — broker IP/port, keep-alive, and tag name/unit table for all 21 sensors |
 | [`FB_MqttTagPublisher.scl`](plc_connector/scl/FB_MqttTagPublisher.scl) | Main Function Block — manages `MQTT_Connect` (with `R_TRIG`-based REQ), iterates over all tags once per interval, calls `FC_BuildJsonPayload`, and fires `MQTT_Publish`; disconnects gracefully when `enable` goes `FALSE` |
+| [`OB1_Main.scl`](plc_connector/scl/OB1_Main.scl) | Main Organisation Block — shows how to scale analog inputs into `DB_SensorValues` and call `FB_MqttTagPublisher`; includes a full 7-step TIA Portal setup guide in the header |
 
 #### How to import into TIA Portal
 
 1. Right-click **Program blocks → External source files → Add new external file** and add each
    `.scl` file from `plc_connector/scl/`.
 2. Right-click each added source → **Generate blocks from source** — TIA Portal compiles the
-   SCL and creates the FC / FB / DB automatically.
+   SCL and creates the FC / FB / DB automatically.  Import in this order:
+   `DB_MqttConfig` → `DB_SensorValues` → `FC_RealToDecStr` → `FC_BuildJsonPayload` → `FB_MqttTagPublisher` → `OB1_Main`.
 3. Update `DB_MqttConfig` in the data view:
-   - Set `brokerIp` to the IP of the host running Docker.
+   - Set `brokerIp` to the IP of the host running Docker (e.g. `'192.168.1.100'`).
    - Set `clientId` to a unique name for this PLC.
-4. Create a global DB named **`DB_SensorValues`** with one `REAL` member per sensor tag,
-   using the variable names listed in the `CASE` block inside `FB_MqttTagPublisher.scl`.
-5. In **OB1**, insert a call to `FB_MqttTagPublisher` (TIA Portal creates the instance DB
-   automatically) and wire:
-   - `enable := TRUE`
-   - `publishInterval := T#2S` (adjust to your scan rate)
-6. Download and go online — the dashboard will immediately start showing live PLC data.
+   - Set `unixEpochOffset` = current Unix timestamp − PLC uptime in seconds (see the
+     header comment in `DB_MqttConfig.scl` for the exact calculation).
+4. In `OB1_Main`, replace the `0.0` placeholders in Section A with the scaled analog-input
+   values for your actual hardware (NORM_X + SCALE_X chain, or direct REAL reads from
+   another DB).  `DB_SensorValues.scl` includes a LAD wiring example in its header.
+5. Download and go online — the dashboard will immediately start showing live PLC data.
 
 #### How `FC_BuildJsonPayload` works (S_CONV / Concat pattern)
 

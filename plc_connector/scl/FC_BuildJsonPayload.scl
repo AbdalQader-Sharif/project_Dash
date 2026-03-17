@@ -1,82 +1,87 @@
 // ============================================================================
-// FC_BuildJsonPayload  –  Assemble an MQTT JSON payload string on the S7-1200
+// FC_BuildJsonPayload  –  Assemble the MQTT JSON payload for one sensor tag
 // ============================================================================
-// Target: Siemens S7-1200, Siemens LMQTT library (TIA Portal V17+).
+// Target  : Siemens S7-1200, TIA Portal V17 or newer.
 //
 // Purpose:
-//   Produces a JSON-formatted string matching the schema expected by the
+//   Produces a JSON string that exactly matches the schema expected by the
 //   project_Dash backend:
 //
 //       {"tag":"pump1/pressure","value":6.12,"unit":"bar",
 //        "timestamp":1710000000.0,"anomaly":false}
 //
-//   Uses FC_RealToDecStr to convert the REAL sensor value to a compact decimal
-//   string, then assembles the full JSON object via a chain of CONCAT calls.
-//   This is the SCL equivalent of the S_CONV → Concat → … → MQTT_Publish
-//   block chain used in LAD/FBD networks.
+//   The backend subscribes to plant/# and parses every arriving MQTT message
+//   as JSON.  All five fields must be present and correctly formatted.
+//
+// How it works (equivalent LAD/FBD construction):
+//   In a LAD/FBD network you would wire:
+//     [S_CONV tagValue→STRING] → [Concat '{"tag":"'] → [Concat tagName]
+//       → [Concat '","value":'] → [Concat valueStr]
+//       → [Concat ',"unit":"']  → [Concat unit]
+//       → [Concat '","timestamp":'] → [Concat timestampStr]
+//       → [Concat ',"anomaly":']    → [Concat anomalyStr]
+//       → [Concat '}']
+//   This SCL function performs the identical sequence of Concat operations.
+//   FC_RealToDecStr replaces the S_CONV block used in LAD for REAL values.
 //
 // Inputs:
-//   tagName    STRING[80]  – MQTT tag identifier, e.g. 'pump1/pressure'
-//   tagValue   REAL        – current sensor reading
-//   unit       STRING[20]  – engineering unit, e.g. 'bar'
-//   timestamp  LREAL       – Unix epoch in whole seconds (from FB_MqttTagPublisher)
-//   anomaly    BOOL        – TRUE when an anomaly is detected
+//   tagName   STRING[80]  – MQTT tag name,        e.g. 'pump1/pressure'
+//   tagValue  REAL        – live sensor reading,   e.g. 6.12
+//   unit      STRING[20]  – engineering unit,      e.g. 'bar'
+//   timestamp LREAL       – Unix epoch in seconds, e.g. 1710000000.0
+//   anomaly   BOOL        – TRUE when an anomaly is flagged
 //
 // Return value:
-//   STRING[500] – complete JSON payload, ready for MQTT_Publish.PAYLOAD
+//   STRING[500] – complete JSON payload, ready to pass to MQTT_Publish.PAYLOAD
 //
-// Notes:
-//   • FC_RealToDecStr must be compiled into the same TIA Portal project.
-//   • LREAL_TO_STRING may produce scientific notation (e.g. "1.71E+09") for
-//     large epoch values.  RFC 8259 allows this form, and the Python backend
-//     (json.loads) accepts it correctly.
-//   • STRING[500] comfortably holds payloads for all 21 sensor tags.
-//     Reduce the size if CPU memory is constrained.
+// Prerequisites:
+//   FC_RealToDecStr must be compiled in the same TIA Portal project.
 // ============================================================================
 
 FUNCTION "FC_BuildJsonPayload" : STRING[500]
 { S7_Optimized_Access := 'TRUE' }
-VERSION : 0.2
+VERSION : 1.0
 
 VAR_INPUT
-    tagName   : STRING[80];   // MQTT tag name, e.g. 'pump1/pressure'
+    tagName   : STRING[80];   // tag identifier, e.g. 'pump1/pressure'
     tagValue  : REAL;         // numeric sensor reading
     unit      : STRING[20];   // engineering unit, e.g. 'bar'
-    timestamp : LREAL;        // Unix timestamp in seconds
+    timestamp : LREAL;        // Unix timestamp in seconds (LREAL for full precision)
     anomaly   : BOOL;         // TRUE = anomaly detected
 END_VAR
 
 VAR_TEMP
-    sValue     : STRING[30];  // tagValue as compact decimal string
-    sTimestamp : STRING[30];  // timestamp as string
-    sAnomaly   : STRING[5];   // JSON boolean literal: 'true' or 'false'
-    buf        : STRING[500]; // accumulation buffer
+    sValue     : STRING[30];   // tagValue as compact decimal string, e.g. "6.12"
+    sTimestamp : STRING[30];   // timestamp as string
+    sAnomaly   : STRING[5];    // JSON boolean literal: "true" or "false"
+    buf        : STRING[500];  // accumulation buffer
 END_VAR
 
 BEGIN
-    // ── 1. Convert numeric and boolean fields to strings ──────────────────────
-
-    // FC_RealToDecStr produces clean decimal notation (e.g. "6.12") instead
-    // of the space-padded or E-notation output of the built-in REAL_TO_STRING.
+    // ── Step 1: Convert REAL sensor value → compact decimal string ────────────
+    // FC_RealToDecStr gives clean output such as "6.12" instead of " 6.120000"
+    // This is the SCL equivalent of an S_CONV block in a LAD network.
     sValue := "FC_RealToDecStr"(value := tagValue);
 
-    // LREAL_TO_STRING is used for the timestamp (integer seconds — no
-    // sub-second precision needed for sensor telemetry).
-    // Note: LREAL_TO_STRING may produce scientific notation (e.g. "1.71E+09")
-    // for large epoch values.  RFC 8259 (JSON specification) permits this form,
-    // and the Python backend (json.loads) accepts it correctly.
+    // ── Step 2: Convert LREAL timestamp → string ──────────────────────────────
+    // LREAL_TO_STRING may produce scientific notation (e.g. "1.71E+09") for
+    // large epoch values.  RFC 8259 (JSON standard) permits this; the Python
+    // backend (json.loads) accepts it correctly, so no manual formatting is needed.
     sTimestamp := LREAL_TO_STRING(timestamp);
 
-    // ── 2. Encode the boolean anomaly flag as a JSON literal ──────────────────
+    // ── Step 3: Encode the boolean anomaly flag as a JSON literal ─────────────
+    // JSON requires lowercase "true" / "false" without quotes.
     IF anomaly THEN
         sAnomaly := 'true';
     ELSE
         sAnomaly := 'false';
     END_IF;
 
-    // ── 3. Assemble the JSON string with CONCAT ───────────────────────────────
-    // Each CONCAT call corresponds to one Concat block in a LAD/FBD network;
-    // FC_RealToDecStr corresponds to one S_CONV block.
+    // ── Step 4: Assemble the JSON string with CONCAT blocks ───────────────────
+    // Each CONCAT call below corresponds to one Concat instruction in LAD/FBD.
+    // The result exactly matches the required schema:
+    //   {"tag":"<tagName>","value":<value>,"unit":"<unit>",
+    //    "timestamp":<ts>,"anomaly":<bool>}
     buf := '{"tag":"';
     buf := CONCAT(IN1 := buf, IN2 := tagName);
     buf := CONCAT(IN1 := buf, IN2 := '","value":');
