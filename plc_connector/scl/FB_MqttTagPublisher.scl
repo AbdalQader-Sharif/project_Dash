@@ -1,0 +1,284 @@
+// ============================================================================
+// FB_MqttTagPublisher  –  Publish all sensor tags via the Siemens LMQTT library
+// ============================================================================
+// Target  : Siemens S7-1200 CPU, firmware V4.4 or newer.
+// Library : Siemens LMQTT_Client  (TIA Portal V17+).
+//           Add via: Options → Manage general libraries → LMQTT_Client.
+//
+// PURPOSE
+// -------
+// This Function Block orchestrates the full MQTT publish cycle for every
+// sensor tag defined in DB_MqttConfig.  Call it from OB1 (or a cyclic-
+// interrupt OB) every PLC scan.  It will:
+//   1. Establish and maintain a persistent MQTT broker session (auto-reconnect
+//      after broker drops).
+//   2. Issue a graceful MQTT_Disconnect when the 'enable' input goes FALSE.
+//   3. Once connected, wait for the publish-interval timer, then publish every
+//      tag in DB_MqttConfig.tags[] — one tag per OB1 scan — so the CPU is
+//      never blocked by a long loop.
+//   4. Call FC_BuildJsonPayload to assemble the exact JSON schema expected by
+//      the project_Dash backend and hand the result to MQTT_Publish.
+//
+// STEP-BY-STEP: Adding this FB in TIA Portal
+// ------------------------------------------
+// 1. Compile and download DB_MqttConfig, DB_SensorValues, FC_RealToDecStr,
+//    and FC_BuildJsonPayload first.
+// 2. Import or paste this file as an External source file, then right-click →
+//    "Generate blocks from source".
+// 3. In OB1, drag "FB_MqttTagPublisher" from the block list into a network.
+//    TIA Portal will automatically create an Instance DB (e.g.
+//    "FB_MqttTagPublisher_DB").
+// 4. Wire the inputs as shown in OB1_Main.scl (or set them in the LAD call box):
+//       enable          ── M0.0  (or always TRUE for always-on publishing)
+//       publishInterval ── T#2S  (publish every 2 seconds)
+//
+// LADDER (LAD) equivalent wiring for the FB call box
+// ---------------------------------------------------
+// ┌──────────────────────────────────────────────────────────┐
+// │  Network N – Call FB_MqttTagPublisher                    │
+// │                                                           │
+// │  |──[M0.0 "EnablePublish"]──|                            │
+// │                              FB_MqttTagPublisher          │
+// │                             ┌────────────────┐           │
+// │  M0.0 ────────────────────► │ enable         │           │
+// │  T#2S ────────────────────► │ publishInterval│           │
+// │                             │                │           │
+// │                             │ connected ─────►── M1.0    │
+// │                             │ lastError ─────►── MW10    │
+// │                             └────────────────┘           │
+// └──────────────────────────────────────────────────────────┘
+//
+// PREREQUISITES
+// -------------
+//   • DB_MqttConfig    (brokerIp, unixEpochOffset, and tags[] populated)
+//   • DB_SensorValues  (filled by your process program each scan)
+//   • FC_BuildJsonPayload
+//   • FC_RealToDecStr
+// ============================================================================
+
+FUNCTION_BLOCK "FB_MqttTagPublisher"
+{ S7_Optimized_Access := 'TRUE' }
+VERSION : 1.0
+
+// ── Interface ─────────────────────────────────────────────────────────────────
+VAR_INPUT
+    enable          : BOOL := TRUE;  // FALSE triggers graceful MQTT_Disconnect
+    publishInterval : TIME := T#2S;  // time between publish batches
+END_VAR
+
+VAR_OUTPUT
+    connected : BOOL;   // mirrors DB_MqttConfig.connected
+    lastError : WORD;   // last LMQTT STATUS word (0x0000 = no error)
+END_VAR
+
+VAR
+    // ── Timekeeping ───────────────────────────────────────────────────────────
+    publishTimer : TON;   // paces the publish cycle
+
+    // ── Siemens LMQTT instruction instances (multi-instance FBs) ─────────────
+    mqttConnect    : MQTT_Connect;
+    mqttPublish    : MQTT_Publish;
+    mqttDisconnect : MQTT_Disconnect;
+
+    // ── Rising-edge detectors for edge-triggered LMQTT REQ inputs ────────────
+    rTrigConnect    : R_TRIG;
+    rTrigPublish    : R_TRIG;
+    rTrigDisconnect : R_TRIG;
+
+    // ── Connection state ──────────────────────────────────────────────────────
+    needConnect    : BOOL := FALSE;
+    needDisconnect : BOOL := FALSE;
+    wasEnabled     : BOOL := FALSE;
+
+    // ── Publish state ─────────────────────────────────────────────────────────
+    currentTag   : INT  := 1;
+    publishCycle : BOOL := FALSE;
+    needPublish  : BOOL := FALSE;
+END_VAR
+
+VAR_TEMP
+    tsLreal  : LREAL;         // current Unix timestamp in seconds
+    payload  : STRING[500];   // assembled JSON string for the current tag
+    topic    : STRING[100];   // MQTT topic = "plant/" + tagName
+    tagVal   : REAL;          // sensor value read from DB_SensorValues
+END_VAR
+
+BEGIN
+
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    // Network 1 – Mirror connection state to output coil
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    connected := "DB_MqttConfig".connected;
+
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    // Network 2 – Detect falling edge on 'enable' → graceful MQTT_Disconnect
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    needDisconnect := wasEnabled AND NOT enable;
+    wasEnabled     := enable;
+
+    IF needDisconnect THEN
+        rTrigDisconnect(CLK := TRUE);
+        mqttDisconnect(REQ          := rTrigDisconnect.Q,
+                       HNDL_CONNECT := "DB_MqttConfig".mqttHandle);
+        rTrigDisconnect(CLK := FALSE);
+        "DB_MqttConfig".connected := FALSE;
+        publishCycle := FALSE;
+        currentTag   := 1;
+        RETURN;
+    END_IF;
+
+    IF NOT enable THEN
+        RETURN;
+    END_IF;
+
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    // Network 3 – MQTT_Connect: establish / maintain broker session
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    // needConnect goes TRUE when the session is not yet established and
+    // MQTT_Connect is not already busy with a pending attempt.
+    // R_TRIG converts the level into a single rising edge so exactly one new
+    // connection attempt is started per transition (LMQTT REQ is edge-triggered).
+    needConnect := NOT "DB_MqttConfig".connected AND NOT mqttConnect.BUSY;
+    rTrigConnect(CLK := needConnect);
+
+    mqttConnect(REQ            := rTrigConnect.Q,
+                BROKER_ADDRESS := "DB_MqttConfig".brokerIp,
+                BROKER_PORT    := "DB_MqttConfig".brokerPort,
+                CLIENT_ID      := "DB_MqttConfig".clientId,
+                KEEP_ALIVE     := "DB_MqttConfig".keepAlive,
+                HNDL_CONNECT   => "DB_MqttConfig".mqttHandle);
+
+    IF mqttConnect.DONE THEN
+        "DB_MqttConfig".connected := TRUE;
+        lastError := 0;
+    ELSIF mqttConnect.ERROR THEN
+        lastError := mqttConnect.STATUS;
+        // BUSY clears on the next scan; needConnect will re-arm and
+        // rTrigConnect will produce a new rising edge to retry.
+    END_IF;
+
+    IF NOT "DB_MqttConfig".connected THEN
+        RETURN;  // wait for the session before attempting to publish
+    END_IF;
+
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    // Network 4 – TON timer: pace the publish batches
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    publishTimer(IN := NOT publishCycle, PT := publishInterval);
+
+    IF publishTimer.Q AND NOT publishCycle THEN
+        publishCycle := TRUE;
+        currentTag   := 1;
+        publishTimer(IN := FALSE);  // reset timer for the next interval
+    END_IF;
+
+    IF NOT publishCycle THEN
+        RETURN;  // nothing to do until the next interval fires
+    END_IF;
+
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    // Network 5 – Read live sensor value for the current tag from DB_SensorValues
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    // The CASE index matches the order of tags[] in DB_MqttConfig.
+    // Your process program writes the measured values into DB_SensorValues
+    // every scan (see LAD wiring example in DB_SensorValues.scl).
+    CASE currentTag OF
+        1:  tagVal := "DB_SensorValues".pump1_flow;
+        2:  tagVal := "DB_SensorValues".pump1_pressure;
+        3:  tagVal := "DB_SensorValues".pump1_temperature;
+        4:  tagVal := "DB_SensorValues".pump1_current;
+        5:  tagVal := "DB_SensorValues".pump1_vibration;
+        6:  tagVal := "DB_SensorValues".pump2_flow;
+        7:  tagVal := "DB_SensorValues".pump2_pressure;
+        8:  tagVal := "DB_SensorValues".pump2_temperature;
+        9:  tagVal := "DB_SensorValues".pump2_current;
+        10: tagVal := "DB_SensorValues".pump2_vibration;
+        11: tagVal := "DB_SensorValues".tank1_level;
+        12: tagVal := "DB_SensorValues".tank2_level;
+        13: tagVal := "DB_SensorValues".compressor_pressure;
+        14: tagVal := "DB_SensorValues".compressor_temperature;
+        15: tagVal := "DB_SensorValues".heat_exchanger_inlet_temp;
+        16: tagVal := "DB_SensorValues".heat_exchanger_outlet_temp;
+        17: tagVal := "DB_SensorValues".conveyor_speed;
+        18: tagVal := "DB_SensorValues".conveyor_current;
+        19: tagVal := "DB_SensorValues".boiler_pressure;
+        20: tagVal := "DB_SensorValues".boiler_temperature;
+        21: tagVal := "DB_SensorValues".boiler_flow;
+    ELSE
+        tagVal := 0.0;
+    END_CASE;
+
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    // Network 6 – Compute Unix timestamp
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    // GET_LTIME() returns nanoseconds since PLC last powered on (LTIME type).
+    // Dividing by 1 000 000 000 (as LINT arithmetic to preserve precision)
+    // gives seconds since PLC boot.  Adding DB_MqttConfig.unixEpochOffset
+    // converts that to a Unix wall-clock timestamp.
+    //
+    // Set DB_MqttConfig.unixEpochOffset = current_unix_time − PLC_uptime_seconds
+    // before the first run.  See DB_MqttConfig.scl header for details.
+    tsLreal := "DB_MqttConfig".unixEpochOffset +
+               LINT_TO_LREAL(LWORD_TO_LINT(GET_LTIME()) / LINT#1000000000);
+
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    // Network 7 – FC_BuildJsonPayload: assemble the JSON string
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    // Result example:
+    //   {"tag":"pump1/pressure","value":6.12,"unit":"bar",
+    //    "timestamp":1710000000.0,"anomaly":false}
+    //
+    // Anomaly detection is performed by the backend.  Set anomaly to FALSE
+    // here unless your PLC process program already detects fault conditions
+    // (e.g. comparing tagVal against a limit and writing a BOOL flag).
+    payload := "FC_BuildJsonPayload"(
+                   tagName   := "DB_MqttConfig".tags[currentTag].name,
+                   tagValue  := tagVal,
+                   unit      := "DB_MqttConfig".tags[currentTag].unit,
+                   timestamp := tsLreal,
+                   anomaly   := FALSE);
+
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    // Network 8 – MQTT_Publish: send one message per tag per scan
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    // MQTT topic = "plant/<tagName>", e.g. "plant/pump1/pressure".
+    // The backend subscribes to "plant/#" and will receive all topics.
+    topic := CONCAT(IN1 := 'plant/',
+                    IN2 := "DB_MqttConfig".tags[currentTag].name);
+
+    // R_TRIG produces a single rising edge on MQTT_Publish.REQ so exactly one
+    // message is sent per tag per cycle (LMQTT REQ is edge-triggered).
+    needPublish := TRUE;
+    rTrigPublish(CLK := needPublish);
+
+    mqttPublish(REQ          := rTrigPublish.Q,
+                HNDL_PUBLISH := "DB_MqttConfig".mqttHandle,
+                TOPIC        := topic,
+                PAYLOAD      := payload,
+                QOS          := USINT#0,
+                RETAIN       := FALSE);
+
+    needPublish := FALSE;
+    rTrigPublish(CLK := FALSE);   // reset for the next tag
+
+    IF mqttPublish.DONE THEN
+        lastError := 0;
+    ELSIF mqttPublish.ERROR THEN
+        lastError := mqttPublish.STATUS;
+        // Force reconnect on known "session lost" status codes
+        IF mqttPublish.STATUS = 16#80A3 OR   // connection lost
+           mqttPublish.STATUS = 16#8090 THEN  // not connected
+            "DB_MqttConfig".connected := FALSE;
+        END_IF;
+    END_IF;
+
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    // Network 9 – Advance tag index; end cycle when all tags are published
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    currentTag := currentTag + 1;
+    IF currentTag > "DB_MqttConfig".tagCount THEN
+        publishCycle := FALSE;
+        currentTag   := 1;
+    END_IF;
+
+END_FUNCTION_BLOCK

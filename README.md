@@ -10,7 +10,6 @@ and an MCP server for AI agent integration.
 | mosquitto | 1883 | MQTT message broker |
 | influxdb | 8086 | Time-series database |
 | simulator | — | PLC tag simulator (publishes 21 sensor tags via MQTT) |
-| plc-connector | — | Real S7-1200 connector (enabled via `--profile real-plc`) |
 | backend | 5000 | FastAPI REST + WebSocket API |
 | frontend | 3000 | React dashboard (served by nginx) |
 | mcp-server | 8090 | MCP tool server for AI agents |
@@ -44,8 +43,8 @@ Open http://localhost:3000 in your browser.
 PLC Simulator ──MQTT──►
                         Mosquitto ──MQTT──► Backend (FastAPI)
 S7-1200 PLC  ──MQTT──►      │                     │
-  (snap7 or                  │               InfluxDB (history)
-  native MQTT)               │                     │
+ (Siemens LMQTT             │               InfluxDB (history)
+  library)                  │                     │
                              │           WebSocket / REST API
                              │                     │
                              │             Frontend (React)
@@ -66,98 +65,25 @@ Available tools: `get_sensors`, `get_sensor`, `get_alarms`, `get_history`, `get_
 
 ## Connecting a Real Siemens S7-1200 PLC
 
-The dashboard ships with a **PLC Connector** service (`plc_connector/`) that reads live tag
-values directly from a physical S7-1200 over the S7 communication protocol
-([python-snap7](https://python-snap7.readthedocs.io/)) and publishes them to the
-same Mosquitto MQTT topics as the simulator.  No changes to the backend are required.
-
-There are **two** supported approaches depending on your hardware/firmware version.
-
----
-
-### Approach A — python-snap7 bridge (recommended for most setups)
-
-The `plc-connector` Docker service uses **python-snap7** to poll PLC Data Blocks (DBs)
-and publish each value to `plant/<tag>` every 2 seconds (configurable).
-
-#### 1. Configure your tags
-
-Edit `plc_connector/tag_config.json`:
-
-```jsonc
-{
-  "plc": {
-    "ip": "192.168.0.1",   // ← your S7-1200 IP address
-    "rack": 0,             // always 0 for S7-1200
-    "slot": 1,             // always 1 for S7-1200 (CPU in slot 1)
-    "poll_interval": 2     // seconds between reads
-  },
-  "tags": [
-    // Map each sensor to a Data Block address in the PLC.
-    // "offset" is the byte offset inside the DB; data_type must be REAL, INT, DINT, WORD, or DWORD.
-    {"name": "pump1/pressure", "unit": "bar", "db_number": 1, "offset": 0, "data_type": "REAL"},
-    {"name": "pump1/temperature", "unit": "°C", "db_number": 1, "offset": 4, "data_type": "REAL"}
-    // … add more tags as needed
-  ]
-}
-```
-
-> **TIA Portal note:** In your PLC project, create a Global Data Block (e.g. DB1) and add one
-> `REAL` variable per sensor.  Make sure the block is **not** optimised (uncheck *"Optimized block
-> access"* in DB properties) so that symbolic offsets match byte offsets used here.
-
-#### 2. Allow S7 PUT/GET access
-
-In TIA Portal → PLC Properties → Protection & Security → enable
-**"Permit access with PUT/GET communication from remote partner"**.
-
-#### 3. Start the connector (disable the simulator)
-
-```bash
-# Stop the simulator, start the real PLC connector instead:
-PLC_IP=192.168.0.1 docker compose --profile real-plc up --build \
-    --scale simulator=0
-```
-
-Or set a permanent override in a `.env` file:
-
-```dotenv
-PLC_IP=192.168.0.1
-PLC_RACK=0
-PLC_SLOT=1
-POLL_INTERVAL=2
-```
-
-Then run:
-
-```bash
-docker compose --profile real-plc up --build --scale simulator=0
-```
-
-The connector retries the PLC connection automatically if it is temporarily unreachable and
-reconnects the MQTT broker on drop-outs.
-
----
-
-### Approach B — S7-1200 Native MQTT client (firmware V4.4 or newer)
-
-From firmware **V4.4** the S7-1200 CPU contains a built-in MQTT client that can publish tag
-values directly to Mosquitto — no extra software needed.
+The S7-1200 CPU (firmware **V4.4 or newer**) contains a built-in MQTT client that can publish
+tag values directly to Mosquitto using the **Siemens LMQTT library** in TIA Portal — no extra
+software or Docker services needed.
 
 Configure the PLC in TIA Portal using the `MQTT_Connect`, `MQTT_Publish`, and `MQTT_Disconnect`
-instructions (available in the *Communication* library):
+function blocks from the LMQTT library (add via *Options → Manage general libraries →
+LMQTT_Client* in TIA Portal V17+):
 
-| Instruction parameter | Value |
-|-----------------------|-------|
-| Broker IP | `<host running Docker, e.g. 192.168.0.100>` |
-| Broker port | `1883` |
+| Parameter | Value |
+|-----------|-------|
+| BROKER_ADDRESS | IP of the host running Docker, e.g. `192.168.0.100` |
+| BROKER_PORT | `1883` |
 | Topic | `plant/<tag>` (e.g. `plant/pump1/pressure`) |
-| QoS | `0` (At most once) |
-| Payload | JSON string matching the schema below |
+| QoS | `0` (at most once; in SCL: `USINT#0`) |
+| Payload | JSON string — assembled by `FC_BuildJsonPayload` (see below) |
 
 #### Required JSON payload schema
 
-The backend expects each MQTT message to contain a JSON object with these fields:
+The backend expects each MQTT message to carry a JSON object with these fields:
 
 ```json
 {
@@ -169,8 +95,61 @@ The backend expects each MQTT message to contain a JSON object with these fields
 }
 ```
 
-Build the payload string inside the PLC using `S_CONV` / `Concat` blocks or a structured
-string builder SCL function, then pass it to `MQTT_Publish`.
+#### SCL blocks — ready to import into TIA Portal
+
+The `plc_connector/scl/` directory contains six SCL source files that implement the complete
+payload-building and MQTT-publishing pipeline on the S7-1200:
+
+| File | Description |
+|------|-------------|
+| [`DB_MqttConfig.scl`](plc_connector/scl/DB_MqttConfig.scl) | Global Data Block — broker IP/port, keep-alive, Unix epoch offset, and tag name/unit table for all 21 sensors |
+| [`DB_SensorValues.scl`](plc_connector/scl/DB_SensorValues.scl) | Global Data Block — one `REAL` member per sensor tag; your process program writes live readings here each scan |
+| [`FC_RealToDecStr.scl`](plc_connector/scl/FC_RealToDecStr.scl) | Converts a `REAL` to a compact decimal string (`"6.12"`) — avoids the leading space and E-notation produced by `REAL_TO_STRING` |
+| [`FC_BuildJsonPayload.scl`](plc_connector/scl/FC_BuildJsonPayload.scl) | Assembles the full JSON string via a chain of `CONCAT` calls (S_CONV + Concat block pattern) |
+| [`FB_MqttTagPublisher.scl`](plc_connector/scl/FB_MqttTagPublisher.scl) | Main Function Block — manages `MQTT_Connect` (with `R_TRIG`-based REQ), iterates over all tags once per interval, calls `FC_BuildJsonPayload`, and fires `MQTT_Publish`; disconnects gracefully when `enable` goes `FALSE` |
+| [`OB1_Main.scl`](plc_connector/scl/OB1_Main.scl) | Main Organisation Block — shows how to scale analog inputs into `DB_SensorValues` and call `FB_MqttTagPublisher`; includes a full 7-step TIA Portal setup guide in the header |
+
+#### How to import into TIA Portal
+
+1. Right-click **Program blocks → External source files → Add new external file** and add each
+   `.scl` file from `plc_connector/scl/`.
+2. Right-click each added source → **Generate blocks from source** — TIA Portal compiles the
+   SCL and creates the FC / FB / DB automatically.  Import in this order:
+   `DB_MqttConfig` → `DB_SensorValues` → `FC_RealToDecStr` → `FC_BuildJsonPayload` → `FB_MqttTagPublisher` → `OB1_Main`.
+3. Update `DB_MqttConfig` in the data view:
+   - Set `brokerIp` to the IP of the host running Docker (e.g. `'192.168.1.100'`).
+   - Set `clientId` to a unique name for this PLC.
+   - Set `unixEpochOffset` = current Unix timestamp − PLC uptime in seconds (see the
+     header comment in `DB_MqttConfig.scl` for the exact calculation).
+4. In `OB1_Main`, replace the `0.0` placeholders in Section A with the scaled analog-input
+   values for your actual hardware (NORM_X + SCALE_X chain, or direct REAL reads from
+   another DB).  `DB_SensorValues.scl` includes a LAD wiring example in its header.
+5. Download and go online — the dashboard will immediately start showing live PLC data.
+
+#### How `FC_BuildJsonPayload` works (S_CONV / Concat pattern)
+
+```
+                  ┌──────────────────────────────────────────────────────────────┐
+                  │                  FC_BuildJsonPayload                         │
+                  │                                                               │
+  REAL tagValue ──┤──► FC_RealToDecStr ──► sValue                               │
+                  │        (≡ S_CONV block)                                      │
+                  │                                   buf := '{"tag":"'          │
+  STRING tagName ─┤──────────────────────────────────► buf := CONCAT(buf, tag)   │
+                  │                                   buf := CONCAT(buf, ...)    │
+  REAL tagValue ──┤──► sValue ─────────────────────── ► buf := CONCAT(buf, val)  │
+                  │                                   buf := CONCAT(buf, ...)    │
+  STRING unit ────┤──────────────────────────────────► buf := CONCAT(buf, unit)  │
+                  │        (each CONCAT ≡ one Concat  buf := CONCAT(buf, ...)    │
+  LREAL timestamp ┤──► LREAL_TO_STRING ─────────────► buf := CONCAT(buf, ts)    │
+                  │         block in LAD/FBD)         buf := CONCAT(buf, ...)    │
+  BOOL anomaly ───┤──► IF/ELSE → "true"/"false" ────► buf := CONCAT(buf, bool)  │
+                  │                                   buf := CONCAT(buf, '}')   │
+                  │                                             │                │
+                  └─────────────────────────────────────────────┼────────────────┘
+                                                                ▼
+                                                      MQTT_Publish.PAYLOAD
+```
 
 No changes to the rest of the stack are required — the backend subscribes to `plant/#` and
 will immediately start displaying your real PLC data.

@@ -1,0 +1,79 @@
+// ============================================================================
+// DB_SensorValues  –  Global Data Block: live sensor readings from the PLC
+// ============================================================================
+// Target  : Siemens S7-1200, TIA Portal V17 or newer.
+//
+// Purpose:
+//   Provides one REAL variable per sensor tag.  Your process program (rungs in
+//   OB1, cyclic OBs, or FB calls) writes the current measured value into each
+//   member every scan.  FB_MqttTagPublisher reads them and publishes the data
+//   over MQTT using the JSON schema expected by the project_Dash backend.
+//
+// STEP-BY-STEP: How to add this block in TIA Portal
+// --------------------------------------------------
+// 1. In the Project tree, expand your CPU and open "Program blocks".
+// 2. Click "Add new block" → "Data block" → type: Global DB.
+// 3. Name it "DB_SensorValues".  Keep "Optimized block access" enabled.
+// 4. Import this file via "External source files → Generate blocks from
+//    source", or copy the declarations below into the SCL editor manually.
+// 5. Compile and download to the PLC.
+// 6. In your process program (LAD rungs or SCL), write the live sensor
+//    readings into each member every scan cycle (see examples in OB1_Main.scl).
+//
+// Ladder (LAD) wiring example for pump1_pressure:
+// ┌──────────────────────────────────────────────────────┐
+// │  Network 1 – Copy AI channel to DB_SensorValues      │
+// │                                                       │
+// │  [MOVE]                                               │
+// │  IN  ── %IW64  (analog input word, e.g. 4..20 mA)   │
+// │        or a NORM_X / SCALE_X output REAL              │
+// │  OUT ── "DB_SensorValues".pump1_pressure              │
+// └──────────────────────────────────────────────────────┘
+// Replace %IW64 with the actual I/O address of your pressure transmitter
+// and scale the raw INT value to engineering units before writing here.
+// ============================================================================
+
+DATA_BLOCK "DB_SensorValues"
+{ S7_Optimized_Access := 'TRUE' }
+VERSION : 1.0
+
+STRUCT
+    // ── Pump 1 ────────────────────────────────────────────────────────────────
+    pump1_flow        : REAL := 0.0;  // m3/h
+    pump1_pressure    : REAL := 0.0;  // bar
+    pump1_temperature : REAL := 0.0;  // °C
+    pump1_current     : REAL := 0.0;  // A
+    pump1_vibration   : REAL := 0.0;  // mm/s
+
+    // ── Pump 2 ────────────────────────────────────────────────────────────────
+    pump2_flow        : REAL := 0.0;  // m3/h
+    pump2_pressure    : REAL := 0.0;  // bar
+    pump2_temperature : REAL := 0.0;  // °C
+    pump2_current     : REAL := 0.0;  // A
+    pump2_vibration   : REAL := 0.0;  // mm/s
+
+    // ── Tanks ─────────────────────────────────────────────────────────────────
+    tank1_level : REAL := 0.0;  // %
+    tank2_level : REAL := 0.0;  // %
+
+    // ── Compressor ────────────────────────────────────────────────────────────
+    compressor_pressure    : REAL := 0.0;  // bar
+    compressor_temperature : REAL := 0.0;  // °C
+
+    // ── Heat exchanger ────────────────────────────────────────────────────────
+    heat_exchanger_inlet_temp  : REAL := 0.0;  // °C
+    heat_exchanger_outlet_temp : REAL := 0.0;  // °C
+
+    // ── Conveyor ──────────────────────────────────────────────────────────────
+    conveyor_speed   : REAL := 0.0;  // m/min
+    conveyor_current : REAL := 0.0;  // A
+
+    // ── Boiler ────────────────────────────────────────────────────────────────
+    boiler_pressure    : REAL := 0.0;  // bar
+    boiler_temperature : REAL := 0.0;  // °C
+    boiler_flow        : REAL := 0.0;  // m3/h
+END_STRUCT
+
+BEGIN
+    // All initial values are 0.0; the process program overwrites them every scan.
+END_DATA_BLOCK

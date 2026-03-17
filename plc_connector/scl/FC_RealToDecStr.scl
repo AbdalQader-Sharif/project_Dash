@@ -1,0 +1,111 @@
+// ============================================================================
+// FC_RealToDecStr  –  Convert a REAL value to a compact decimal string
+// ============================================================================
+// Target  : Siemens S7-1200, TIA Portal V17 or newer.
+//
+// Purpose:
+//   The built-in REAL_TO_STRING() produces output such as " 6.120000" (with a
+//   leading space and trailing zeros) or scientific notation like "1.0E+01".
+//   Neither form is suitable inside a JSON number field.
+//
+//   This function produces clean decimal notation, for example:
+//       6.12      →  "6.12"
+//      -3.5       →  "-3.5"
+//       0.0       →  "0.0"
+//      10.0       →  "10.0"
+//
+//   In TIA Portal LAD/FBD, this block replaces a chain of S_CONV instructions
+//   that would be needed to achieve the same formatting.
+//
+// Algorithm:
+//   1. Take the absolute value and split into integer and fractional parts.
+//   2. Convert the integer part with INT_TO_STRING; prepend '-' if negative.
+//   3. Compute up to 3 decimal digits, rounding at the 4th.
+//   4. Drop trailing zeros but always keep at least one digit after the point
+//      so the result is a valid JSON number (e.g. "6.0", not "6").
+//
+// Limitations:
+//   • Integer-part magnitude must be < 32 768 (INT range).
+//     Values at or above 32 768 fall back to REAL_TO_STRING() output.
+//   • NaN and ±INF are not handled (not expected from normal sensor readings).
+// ============================================================================
+
+FUNCTION "FC_RealToDecStr" : STRING[30]
+{ S7_Optimized_Access := 'TRUE' }
+VERSION : 1.0
+
+VAR_INPUT
+    value : REAL;   // sensor reading to format
+END_VAR
+
+VAR_TEMP
+    absVal   : REAL;
+    intPart  : INT;
+    fracReal : REAL;
+    d1       : INT;   // 1st decimal digit (tenths)
+    d2       : INT;   // 2nd decimal digit (hundredths)
+    d3       : INT;   // 3rd decimal digit (thousandths, used for rounding)
+    sInt     : STRING[20];
+    sFrac    : STRING[10];
+END_VAR
+
+BEGIN
+    // ── Guard: very large magnitudes overflow INT – fall back to built-in ─────
+    absVal := ABS(value);
+    IF absVal >= 32768.0 THEN
+        "FC_RealToDecStr" := REAL_TO_STRING(value);
+        RETURN;
+    END_IF;
+
+    // ── Integer part ──────────────────────────────────────────────────────────
+    intPart := REAL_TO_INT(TRUNC(absVal));
+    sInt    := INT_TO_STRING(intPart);
+    IF value < 0.0 THEN
+        sInt := CONCAT(IN1 := '-', IN2 := sInt);
+    END_IF;
+
+    // ── Fractional digits (3 digits, rounded at the 4th) ─────────────────────
+    fracReal := absVal - TRUNC(absVal);   // remainder in [0.0, 1.0)
+
+    d1 := REAL_TO_INT(TRUNC(fracReal * 10.0));
+    fracReal := fracReal * 10.0 - TRUNC(fracReal * 10.0);
+
+    d2 := REAL_TO_INT(TRUNC(fracReal * 10.0));
+    fracReal := fracReal * 10.0 - TRUNC(fracReal * 10.0);
+
+    d3 := REAL_TO_INT(TRUNC(fracReal * 10.0 + 0.5));  // round
+
+    // Propagate carry if rounding pushed a digit to 10
+    IF d3 >= 10 THEN
+        d3 := 0;
+        d2 := d2 + 1;
+        IF d2 >= 10 THEN
+            d2 := 0;
+            d1 := d1 + 1;
+            IF d1 >= 10 THEN   // e.g. 9.9995 → 10.000
+                d1      := 0;
+                intPart := intPart + 1;
+                sInt    := INT_TO_STRING(intPart);
+                IF value < 0.0 THEN
+                    sInt := CONCAT(IN1 := '-', IN2 := sInt);
+                END_IF;
+            END_IF;
+        END_IF;
+    END_IF;
+
+    // Drop trailing zeros; always keep at least one fractional digit
+    IF d3 <> 0 THEN
+        sFrac := CONCAT(IN1 := INT_TO_STRING(d1),
+                        IN2 := CONCAT(IN1 := INT_TO_STRING(d2),
+                                      IN2 := INT_TO_STRING(d3)));
+    ELSIF d2 <> 0 THEN
+        sFrac := CONCAT(IN1 := INT_TO_STRING(d1),
+                        IN2 := INT_TO_STRING(d2));
+    ELSE
+        sFrac := INT_TO_STRING(d1);   // minimum: one digit after the decimal point
+    END_IF;
+
+    // ── Assemble result ───────────────────────────────────────────────────────
+    "FC_RealToDecStr" := CONCAT(IN1 := sInt,
+                                IN2 := CONCAT(IN1 := '.', IN2 := sFrac));
+END_FUNCTION
